@@ -253,13 +253,13 @@ static BOOL _preparedOnce = NO;
   CGRect rectSoFar_;
 }
 
-- (instancetype)initWithFrame:(CGRect)frame {
-  return [self initWithFrame:frame screenScale:[UIScreen mainScreen].scale];
-}
-
 - (instancetype)initWithFrame:(CGRect)frame screenScale:(CGFloat)screenScale {
   if (self = [super initWithFrame:frame]) {
     self.backgroundColor = UIColor.clearColor;
+    // A zero scale (e.g. a detached screen) would make the transform below NaN.
+    if (screenScale <= 0) {
+      screenScale = [UIScreen mainScreen].scale;
+    }
     _reverseScreenScale = CATransform3DMakeScale(1 / screenScale, 1 / screenScale, 1);
     rectSoFar_ = self.bounds;
     containsNonRectPath_ = NO;
@@ -474,12 +474,11 @@ static BOOL _preparedOnce = NO;
   return self;
 }
 
-- (FlutterClippingMaskView*)getMaskViewWithFrame:(CGRect)frame {
+- (FlutterClippingMaskView*)getMaskViewWithFrame:(CGRect)frame screenScale:(CGFloat)screenScale {
   FML_DCHECK(self.pool.count <= self.capacity);
   if (self.pool.count == 0) {
     // The pool is empty, alloc a new one.
-    return [[FlutterClippingMaskView alloc] initWithFrame:frame
-                                              screenScale:UIScreen.mainScreen.scale];
+    return [[FlutterClippingMaskView alloc] initWithFrame:frame screenScale:screenScale];
   }
   FlutterClippingMaskView* maskView = [self.pool anyObject];
   maskView.frame = frame;

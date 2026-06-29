@@ -10,6 +10,7 @@
 #import <WebKit/WebKit.h>
 #import <XCTest/XCTest.h>
 
+#include <cmath>
 #include <memory>
 
 #include "flutter/display_list/effects/dl_image_filters.h"
@@ -26,7 +27,10 @@
 #import "flutter/shell/platform/darwin/ios/framework/Source/FlutterPlatformViewsTestHelper.h"
 #import "flutter/shell/platform/darwin/ios/framework/Source/FlutterPlatformViews_Internal.h"
 #import "flutter/shell/platform/darwin/ios/framework/Source/FlutterTouchInterceptingView+Test.h"
+#import "flutter/shell/platform/darwin/ios/framework/Source/UIViewController+FlutterScreenAndSceneIfLoaded.h"
+#include "flutter/shell/platform/darwin/ios/framework/Source/overlay_layer_pool.h"
 #include "flutter/shell/platform/darwin/ios/ios_context_noop.h"
+#include "flutter/shell/platform/darwin/ios/ios_surface.h"
 #include "flutter/shell/platform/darwin/ios/platform_view_ios.h"
 
 FLUTTER_ASSERT_ARC
@@ -321,6 +325,31 @@ BOOL BlurRadiusEqualToBlurRadius(CGFloat radius1, CGFloat radius2) {
 
 }  // namespace
 }  // namespace flutter
+
+// A FlutterViewController with a controllable screen scale. A mockScreenScale of 0 makes
+// flutterScreenIfViewLoaded return nil, as happens when the app is backgrounded.
+@interface FlutterPlatformViewsTestMockFlutterViewController : FlutterViewController
+@property(nonatomic, assign) CGFloat mockScreenScale;
+@end
+
+@implementation FlutterPlatformViewsTestMockFlutterViewController
+- (UIScreen*)flutterScreenIfViewLoaded {
+  if (self.mockScreenScale == 0) {
+    return nil;
+  }
+  UIScreen* mockScreen = OCMClassMock([UIScreen class]);
+  OCMStub([mockScreen scale]).andReturn(self.mockScreenScale);
+  return mockScreen;
+}
+@end
+
+@interface FlutterPlatformViewsController (Test)
+- (CGFloat)screenScale;
+@end
+
+@interface FlutterClippingMaskView (Test)
+- (CATransform3D)reverseScreenScale;
+@end
 
 @interface FlutterPlatformViewsTest : XCTestCase
 @end
@@ -4665,15 +4694,105 @@ static UIGestureRecognizer* FindForwardingGestureRecognizer(UIView* view) {
   XCTAssertFalse(view.flt_hasFirstResponderInViewHierarchySubtree);
 }
 
+// The scale comes from the attached screen, which may be an external display.
+- (void)testScreenScaleUsesAttachedScreenScale {
+  FlutterPlatformViewsController* controller = [[FlutterPlatformViewsController alloc] init];
+  FlutterPlatformViewsTestMockFlutterViewController* mockViewController =
+      [[FlutterPlatformViewsTestMockFlutterViewController alloc] init];
+  mockViewController.mockScreenScale = 3;
+  controller.flutterViewController = mockViewController;
+
+  XCTAssertEqual(controller.screenScale, 3);
+}
+
+- (void)testScreenScaleFallsBackToMainScreenWhenNoViewController {
+  FlutterPlatformViewsController* controller = [[FlutterPlatformViewsController alloc] init];
+
+  XCTAssertEqual(controller.screenScale, [UIScreen mainScreen].scale);
+  XCTAssertGreaterThan(controller.screenScale, 0);
+}
+
+// Regression test for https://github.com/flutter/flutter/issues/165648: when backgrounded the
+// screen scale reads back as 0, and the cached value must be returned instead.
+- (void)testScreenScaleCachesLastValidValueWhenBackgrounded {
+  FlutterPlatformViewsController* controller = [[FlutterPlatformViewsController alloc] init];
+  FlutterPlatformViewsTestMockFlutterViewController* mockViewController =
+      [[FlutterPlatformViewsTestMockFlutterViewController alloc] init];
+  mockViewController.mockScreenScale = 3;
+  controller.flutterViewController = mockViewController;
+
+  // Observe a valid scale so it is cached, then drop it to 0 as happens when backgrounded.
+  XCTAssertEqual(controller.screenScale, 3);
+  mockViewController.mockScreenScale = 0;
+
+  XCTAssertEqual(controller.screenScale, 3);
+  XCTAssertGreaterThan(controller.screenScale, 0);
+}
+
+// A 0 screen scale must not produce a NaN/inf reverse-scale transform.
+- (void)testClippingMaskViewGuardsAgainstZeroScreenScale {
+  FlutterClippingMaskView* maskView =
+      [[FlutterClippingMaskView alloc] initWithFrame:CGRectMake(0, 0, 10, 10) screenScale:0];
+  CATransform3D transform = maskView.reverseScreenScale;
+
+  XCTAssertFalse(std::isnan(transform.m11));
+  XCTAssertFalse(std::isnan(transform.m22));
+  XCTAssertTrue(std::isfinite(transform.m11));
+  XCTAssertTrue(std::isfinite(transform.m22));
+}
+
+- (void)testClippingMaskViewUsesProvidedScreenScale {
+  FlutterClippingMaskView* maskView =
+      [[FlutterClippingMaskView alloc] initWithFrame:CGRectMake(0, 0, 10, 10) screenScale:3];
+  CATransform3D transform = maskView.reverseScreenScale;
+
+  XCTAssertEqualWithAccuracy(transform.m11, 1.0 / 3.0, kFloatCompareEpsilon);
+  XCTAssertEqualWithAccuracy(transform.m22, 1.0 / 3.0, kFloatCompareEpsilon);
+}
+
+// Regression test for https://github.com/flutter/flutter/issues/165648: a 0 screen scale must not
+// produce a NaN/inf overlay frame.
+- (void)testOverlayLayerUpdateViewStateWithZeroScreenScaleDoesNotProduceNaN {
+  UIView* overlayView = [[UIView alloc] init];
+  UIView* overlayWrapper = [[UIView alloc] init];
+  flutter::OverlayLayer layer(overlayView, overlayWrapper, nullptr, nullptr);
+  UIView* flutterView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, 100)];
+
+  layer.UpdateViewState(flutterView, flutter::DlRect::MakeXYWH(0, 0, 300, 300), /*screenScale=*/0,
+                        /*view_id=*/0, /*overlay_id=*/0);
+
+  CGRect frame = overlayWrapper.frame;
+  XCTAssertFalse(std::isnan(frame.origin.x));
+  XCTAssertFalse(std::isnan(frame.origin.y));
+  XCTAssertTrue(std::isfinite(frame.size.width));
+  XCTAssertTrue(std::isfinite(frame.size.height));
+  XCTAssertGreaterThan(frame.size.width, 0);
+}
+
+- (void)testOverlayLayerUpdateViewStateScalesByProvidedScreenScale {
+  UIView* overlayView = [[UIView alloc] init];
+  UIView* overlayWrapper = [[UIView alloc] init];
+  flutter::OverlayLayer layer(overlayView, overlayWrapper, nullptr, nullptr);
+  UIView* flutterView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, 100)];
+
+  layer.UpdateViewState(flutterView, flutter::DlRect::MakeXYWH(0, 0, 300, 300), /*screenScale=*/3,
+                        /*view_id=*/0, /*overlay_id=*/0);
+
+  // 300 physical px / scale 3 == 100 points.
+  XCTAssertEqualWithAccuracy(overlayWrapper.frame.size.width, 100, kFloatCompareEpsilon);
+  XCTAssertEqualWithAccuracy(overlayWrapper.frame.size.height, 100, kFloatCompareEpsilon);
+}
+
 - (void)testFlutterClippingMaskViewPoolReuseViewsAfterRecycle {
+  CGFloat scale = [UIScreen mainScreen].scale;
   FlutterClippingMaskViewPool* pool = [[FlutterClippingMaskViewPool alloc] initWithCapacity:2];
-  FlutterClippingMaskView* view1 = [pool getMaskViewWithFrame:CGRectZero];
-  FlutterClippingMaskView* view2 = [pool getMaskViewWithFrame:CGRectZero];
+  FlutterClippingMaskView* view1 = [pool getMaskViewWithFrame:CGRectZero screenScale:scale];
+  FlutterClippingMaskView* view2 = [pool getMaskViewWithFrame:CGRectZero screenScale:scale];
   [pool insertViewToPoolIfNeeded:view1];
   [pool insertViewToPoolIfNeeded:view2];
   CGRect newRect = CGRectMake(0, 0, 10, 10);
-  FlutterClippingMaskView* view3 = [pool getMaskViewWithFrame:newRect];
-  FlutterClippingMaskView* view4 = [pool getMaskViewWithFrame:newRect];
+  FlutterClippingMaskView* view3 = [pool getMaskViewWithFrame:newRect screenScale:scale];
+  FlutterClippingMaskView* view4 = [pool getMaskViewWithFrame:newRect screenScale:scale];
   // view3 and view4 should randomly get either of view1 and view2.
   NSSet* set1 = [NSSet setWithObjects:view1, view2, nil];
   NSSet* set2 = [NSSet setWithObjects:view3, view4, nil];
@@ -4683,10 +4802,11 @@ static UIGestureRecognizer* FindForwardingGestureRecognizer(UIView* view) {
 }
 
 - (void)testFlutterClippingMaskViewPoolAllocsNewMaskViewsAfterReachingCapacity {
+  CGFloat scale = [UIScreen mainScreen].scale;
   FlutterClippingMaskViewPool* pool = [[FlutterClippingMaskViewPool alloc] initWithCapacity:2];
-  FlutterClippingMaskView* view1 = [pool getMaskViewWithFrame:CGRectZero];
-  FlutterClippingMaskView* view2 = [pool getMaskViewWithFrame:CGRectZero];
-  FlutterClippingMaskView* view3 = [pool getMaskViewWithFrame:CGRectZero];
+  FlutterClippingMaskView* view1 = [pool getMaskViewWithFrame:CGRectZero screenScale:scale];
+  FlutterClippingMaskView* view2 = [pool getMaskViewWithFrame:CGRectZero screenScale:scale];
+  FlutterClippingMaskView* view3 = [pool getMaskViewWithFrame:CGRectZero screenScale:scale];
   XCTAssertNotEqual(view1, view3);
   XCTAssertNotEqual(view2, view3);
 }
@@ -4695,7 +4815,8 @@ static UIGestureRecognizer* FindForwardingGestureRecognizer(UIView* view) {
   __weak UIView* weakView;
   @autoreleasepool {
     FlutterClippingMaskViewPool* pool = [[FlutterClippingMaskViewPool alloc] initWithCapacity:2];
-    FlutterClippingMaskView* view = [pool getMaskViewWithFrame:CGRectZero];
+    FlutterClippingMaskView* view = [pool getMaskViewWithFrame:CGRectZero
+                                                   screenScale:[UIScreen mainScreen].scale];
     weakView = view;
     XCTAssertNotNil(weakView);
   }
@@ -5313,9 +5434,9 @@ static UIGestureRecognizer* FindForwardingGestureRecognizer(UIView* view) {
   auto pool = flutter::OverlayLayerPool{};
 
   // Add layers to the pool.
-  pool.CreateLayer(ios_context, MTLPixelFormatBGRA8Unorm);
+  pool.CreateLayer(ios_context, MTLPixelFormatBGRA8Unorm, [UIScreen mainScreen].scale);
   XCTAssertEqual(pool.size(), 1u);
-  pool.CreateLayer(ios_context, MTLPixelFormatBGRA8Unorm);
+  pool.CreateLayer(ios_context, MTLPixelFormatBGRA8Unorm, [UIScreen mainScreen].scale);
   XCTAssertEqual(pool.size(), 2u);
 
   // Mark all layers as unused.

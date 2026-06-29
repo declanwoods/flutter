@@ -17,6 +17,7 @@
 #import "flutter/shell/platform/darwin/common/InternalFlutterSwiftCommon/InternalFlutterSwiftCommon.h"
 #import "flutter/shell/platform/darwin/ios/framework/Source/FlutterOverlayView.h"
 #import "flutter/shell/platform/darwin/ios/framework/Source/FlutterView.h"
+#import "flutter/shell/platform/darwin/ios/framework/Source/UIViewController+FlutterScreenAndSceneIfLoaded.h"
 #include "flutter/shell/platform/darwin/ios/framework/Source/overlay_layer_pool.h"
 #import "flutter/shell/platform/darwin/ios/ios_surface.h"
 
@@ -255,6 +256,10 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
 
 - (void)clipViewSetMaskView:(UIView*)clipView;
 
+// The scale of the screen the platform views are rendered on. May differ from the main screen
+// when rendering to an external display.
+- (CGFloat)screenScale;
+
 // Applies the mutators in the mutatorsStack to the UIView chain that was constructed by
 // `ReconstructClipViewsChain`
 //
@@ -280,7 +285,8 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
 
 /// Runs on the platform thread.
 - (void)createLayerWithIosContext:(const std::shared_ptr<flutter::IOSContext>&)iosContext
-                      pixelFormat:(MTLPixelFormat)pixelFormat;
+                      pixelFormat:(MTLPixelFormat)pixelFormat
+                      screenScale:(CGFloat)screenScale;
 
 /// Removes overlay views and platform views that aren't needed in the current frame.
 /// Must run on the platform thread.
@@ -318,6 +324,9 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
   std::vector<int64_t> _visitedPlatformViews;
   std::unordered_set<int64_t> _viewsToRecomposite;
   std::vector<int64_t> _previousCompositionOrder;
+
+  // The last non-zero screen scale, used as a fallback when the screen is unavailable.
+  CGFloat _lastValidScreenScale;
 }
 
 - (id)init {
@@ -327,8 +336,25 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
         [[FlutterClippingMaskViewPool alloc] initWithCapacity:kFlutterClippingMaskViewPoolCapacity];
     _hadPlatformViews = NO;
     _canApplyBlurBackdrop = YES;
+    _lastValidScreenScale = 0;
   }
   return self;
+}
+
+- (CGFloat)screenScale {
+  // The view's screen can be nil while the app is backgrounded, reporting a scale of 0. Cache the
+  // last valid scale and fall back to it, then to the main screen, so a frame is never divided by a
+  // zero scale (which yields NaN and crashes CALayer).
+  // https://github.com/flutter/flutter/issues/165648
+  CGFloat scale = [self.flutterViewController flutterScreenIfViewLoaded].scale;
+  if (scale > 0) {
+    _lastValidScreenScale = scale;
+    return scale;
+  }
+  if (_lastValidScreenScale > 0) {
+    return _lastValidScreenScale;
+  }
+  return [UIScreen mainScreen].scale;
 }
 
 - (FlutterFMLTaskRunner*)taskRunner {
@@ -575,7 +601,7 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
   CGRect frame =
       CGRectMake(-clipView.frame.origin.x, -clipView.frame.origin.y,
                  CGRectGetWidth(self.flutterView.bounds), CGRectGetHeight(self.flutterView.bounds));
-  clipView.maskView = [self.maskViewPool getMaskViewWithFrame:frame];
+  clipView.maskView = [self.maskViewPool getMaskViewWithFrame:frame screenScale:self.screenScale];
 }
 
 - (void)applyMutators:(const flutter::MutatorsStack&)mutatorsStack
@@ -598,7 +624,7 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
     [self.maskViewPool insertViewToPoolIfNeeded:(FlutterClippingMaskView*)(clipView.maskView)];
     clipView.maskView = nil;
   }
-  CGFloat screenScale = [UIScreen mainScreen].scale;
+  CGFloat screenScale = self.screenScale;
   auto iter = mutatorsStack.Begin();
   while (iter != mutatorsStack.End()) {
     switch ((*iter)->GetType()) {
@@ -780,7 +806,7 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
   // when we apply the transforms matrix in |applyMutators:embeddedView:boundingRect|, we need
   // to remember to do a reverse translate.
   const DlRect& rect = params.finalBoundingRect();
-  CGFloat screenScale = [UIScreen mainScreen].scale;
+  CGFloat screenScale = self.screenScale;
   clippingView.frame = CGRectMake(rect.GetX() / screenScale, rect.GetY() / screenScale,
                                   rect.GetWidth() / screenScale, rect.GetHeight() / screenScale);
   [self applyMutators:mutatorStack embeddedView:touchInterceptor boundingRect:rect];
@@ -962,9 +988,12 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
   // latch right below).
   auto latch = std::make_shared<fml::CountDownLatch>(1u);
   [self.taskRunner runNowOrPostTask:^{
+    // -screenScale touches UIKit, so read it here on the platform thread.
+    CGFloat screenScale = self.screenScale;
     for (auto i = 0u; i < missingLayerCount; i++) {
       [self createLayerWithIosContext:iosContext
-                          pixelFormat:((FlutterView*)self.flutterView).pixelFormat];
+                          pixelFormat:((FlutterView*)self.flutterView).pixelFormat
+                          screenScale:screenScale];
     }
     latch->CountDown();
   }];
@@ -998,9 +1027,11 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
   [CATransaction begin];
 
   // Configure Flutter overlay views.
+  CGFloat screenScale = self.screenScale;
   for (const auto& [viewId, layerData] : platformViewLayers) {
     layerData.layer->UpdateViewState(self.flutterView,     //
                                      layerData.rect,       //
+                                     screenScale,          //
                                      layerData.view_id,    //
                                      layerData.overlay_id  //
     );
@@ -1078,8 +1109,9 @@ static void ApplyNonRectClipToOverlayCanvas(flutter::DlCanvas* overlay_canvas,
 }
 
 - (void)createLayerWithIosContext:(const std::shared_ptr<flutter::IOSContext>&)iosContext
-                      pixelFormat:(MTLPixelFormat)pixelFormat {
-  self.layerPool->CreateLayer(iosContext, pixelFormat);
+                      pixelFormat:(MTLPixelFormat)pixelFormat
+                      screenScale:(CGFloat)screenScale {
+  self.layerPool->CreateLayer(iosContext, pixelFormat, screenScale);
 }
 
 - (void)removeUnusedLayers:(const std::vector<std::shared_ptr<flutter::OverlayLayer>>&)unusedLayers

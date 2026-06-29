@@ -20,9 +20,13 @@ OverlayLayer::OverlayLayer(UIView* overlay_view,
 
 void OverlayLayer::UpdateViewState(UIView* flutter_view,
                                    DlRect rect,
+                                   CGFloat screenScale,
                                    int64_t view_id,
                                    int64_t overlay_id) {
-  auto screenScale = [UIScreen mainScreen].scale;
+  // A zero scale (e.g. a detached screen) would make the frame below NaN.
+  if (screenScale <= 0) {
+    screenScale = [UIScreen mainScreen].scale;
+  }
   // Set the size of the overlay view wrapper.
   // This wrapper view masks the overlay view.
   overlay_view_wrapper.frame =
@@ -54,13 +58,13 @@ std::shared_ptr<OverlayLayer> OverlayLayerPool::GetNextLayer() {
 }
 
 void OverlayLayerPool::CreateLayer(const std::shared_ptr<IOSContext>& ios_context,
-                                   MTLPixelFormat pixel_format) {
+                                   MTLPixelFormat pixel_format,
+                                   CGFloat screenScale) {
   FML_DCHECK([[NSThread currentThread] isMainThread]);
   std::shared_ptr<OverlayLayer> layer;
   UIView* overlay_view;
   UIView* overlay_view_wrapper;
 
-  CGFloat screenScale = [UIScreen mainScreen].scale;
   overlay_view = [[FlutterOverlayView alloc] initWithContentsScale:screenScale
                                                        pixelFormat:pixel_format];
   overlay_view_wrapper = [[FlutterOverlayView alloc] initWithContentsScale:screenScale
